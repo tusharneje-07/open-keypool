@@ -5,7 +5,8 @@ Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-
 ## Install
 
 ```bash
-pip install open-keypool
+# From TestPyPI (until published on PyPI):
+pip install --index-url https://test.pypi.org/simple/ open-keypool
 ```
 
 ## Quickstart
@@ -13,40 +14,64 @@ pip install open-keypool
 ### Local keys array
 
 ```python
-from open_keypool import KeyPool, AllKeysExhaustedError
+from open_keypool import KeyPool, AllKeysExhaustedError, KeyState
 
 pool = KeyPool(keys=["sk-key1", "sk-key2", "sk-key3"], strategy="round_robin")
 
 for attempt in range(pool.max_retries):
     key = pool.get_key()
     response = call_your_api(key)
-    if response.status_code == 429:
-        retry_after = float(response.headers.get("Retry-After", 0))
-        pool.mark_rate_limited(key, retry_after=retry_after or None)
-    elif response.status_code in (401, 403):
-        pool.mark_invalid(key)
-    else:
-        pool.mark_success(key)
-        break
+
+    # Feed the response — the pool decides success / cooldown / disable
+    new_state = pool.handle_response(
+        key, response.status_code,
+        headers=dict(response.headers),
+        body=response.json(),
+    )
+
+    if new_state == KeyState.ACTIVE:
+        break  # success
+    elif new_state == KeyState.COOLDOWN:
+        continue  # key is rate-limited, rotate to next
+    elif new_state == KeyState.DISABLED:
+        continue  # key is invalid, rotate to next
 ```
 
-### Doppler
+### Handle response auto-dispatching
+
+`pool.handle_response(key, status_code, headers, body)` introspects the HTTP response and automatically:
+
+| Status | Action |
+|---|---|
+| **2xx** | Marks success — clears errors, resets failure count |
+| **429**, **413**, or `"rate_limit_exceeded"` in body | Marks cooldown, reads `Retry-After` header |
+| **401**, **403** | Permanently disables the key |
+| **5xx** | Places on cooldown (transient) |
+
+Returns `KeyState` so you can branch on the result.
+
+### Multi-key Doppler pool with status tracking
 
 ```python
 import os
 from open_keypool import KeyPool
 
 DOPPLER_TOKEN = os.getenv("DOPPLER_TOKEN", "dp.st.YOUR_SERVICE_TOKEN")
-PROJECT_NAME = "refactor-ai"
-CONFIG_NAME = "dev"
 
 pool = KeyPool.from_doppler(
     token=DOPPLER_TOKEN,
-    project=PROJECT_NAME,
-    config=CONFIG_NAME,
-    key_prefix="MY_APP_",
-    strategy="lru",
+    project="refactor-ai",
+    config="dev",
+    key_prefix="GROQ_",
+    strategy="round_robin",
 )
+
+# Every key's state, error history, and cooldown — safely masked
+for masked_key, info in pool.status().items():
+    print(f"{masked_key}  state={info['state']}  "
+          f"http={info.get('last_status_code')}  "
+          f"err=[{info.get('last_error_code')}]  "
+          f"failures={info['failure_count']}")
 ```
 
 ## Constructor parameters
@@ -64,4 +89,6 @@ pool = KeyPool.from_doppler(
 
 Pass `force_refresh=True` to bypass the cache and re-fetch immediately (useful after rotating keys in Doppler when you don't want to wait out the TTL).
 
-Full API reference: [docs/index.html](docs/index.html)
+## Full API reference
+
+[docs/index.html](docs/index.html) — self-contained HTML page with quickstart + class/method documentation generated from docstrings.
