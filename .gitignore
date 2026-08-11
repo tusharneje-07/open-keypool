@@ -26,9 +26,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# pdoc generated docs
-docs/index.html
-
 # Local Test
 deep_test/
 run_groq_test.py
