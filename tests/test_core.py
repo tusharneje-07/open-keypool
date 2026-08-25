@@ -678,3 +678,162 @@ def test_exception_message_never_contains_raw_key(monkeypatch):
     msg = str(excinfo.value)
     assert "sk-raw-secret-key-12345" not in msg
     assert "..." in msg
+
+
+# ---------------------------------------------------------------------------
+# from_env
+# ---------------------------------------------------------------------------
+
+
+def test_from_env_loads_matching_env_vars(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TSN_GROQ_KEY=sk-aaa\n"
+        "BACKUP_GROQ_KEY=sk-bbb\n"
+        "OTHER_SECRET=sk-ccc\n"
+    )
+    monkeypatch.delenv("TSN_GROQ_KEY", raising=False)
+    monkeypatch.delenv("BACKUP_GROQ_KEY", raising=False)
+    monkeypatch.delenv("OTHER_SECRET", raising=False)
+
+    pool = KeyPool.from_env(suffix="GROQ_KEY", env_file=str(env_file))
+    keys = {pool.get_key() for _ in range(10)}
+    assert keys == {"sk-aaa", "sk-bbb"}
+
+
+def test_from_env_no_match_raises_runtime_error(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("OTHER_SECRET=sk-ccc\n")
+    monkeypatch.delenv("OTHER_SECRET", raising=False)
+
+    with pytest.raises(RuntimeError, match="No environment variables"):
+        KeyPool.from_env(suffix="NONEXISTENT", env_file=str(env_file))
+
+
+def test_from_env_empty_suffix_raises_value_error():
+    with pytest.raises(ValueError, match="non-empty"):
+        KeyPool.from_env(suffix="")
+
+
+def test_from_env_none_suffix_raises_value_error():
+    with pytest.raises(ValueError, match="non-empty"):
+        KeyPool.from_env(suffix=None)
+
+
+def test_from_env_ignores_empty_values(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("GROQ_KEY=sk-aaa\nBACKUP_GROQ_KEY=  \nOTHER_GROQ_KEY=sk-ccc\n")
+    monkeypatch.delenv("GROQ_KEY", raising=False)
+    monkeypatch.delenv("BACKUP_GROQ_KEY", raising=False)
+    monkeypatch.delenv("OTHER_GROQ_KEY", raising=False)
+
+    pool = KeyPool.from_env(suffix="GROQ_KEY", env_file=str(env_file))
+    assert len(pool.status()) == 2
+
+
+# ---------------------------------------------------------------------------
+# from_json
+# ---------------------------------------------------------------------------
+
+
+def test_from_json_loads_all_entries(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text('{"KEY_1": "sk-aaa", "KEY_2": "sk-bbb", "KEY_3": "sk-ccc"}')
+
+    pool = KeyPool.from_json(str(p))
+    keys = {pool.get_key() for _ in range(20)}
+    assert keys == {"sk-aaa", "sk-bbb", "sk-ccc"}
+
+
+def test_from_json_filters_by_suffix(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text(
+        '{"TSN_GROQ_KEY": "sk-aaa", "BACKUP_GROQ_KEY": "sk-bbb", "OTHER_SECRET": "sk-ccc"}'
+    )
+
+    pool = KeyPool.from_json(str(p), suffix="GROQ_KEY")
+    keys = {pool.get_key() for _ in range(10)}
+    assert keys == {"sk-aaa", "sk-bbb"}
+
+
+def test_from_json_no_suffix_includes_all(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text('{"A": "sk-aaa", "B": "sk-bbb"}')
+
+    pool = KeyPool.from_json(str(p))
+    assert len(pool.status()) == 2
+
+
+def test_from_json_file_not_found():
+    with pytest.raises(FileNotFoundError, match="not found"):
+        KeyPool.from_json("/nonexistent/path.json")
+
+
+def test_from_json_invalid_json(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{not valid json")
+
+    with pytest.raises(ValueError, match="Invalid JSON"):
+        KeyPool.from_json(str(p))
+
+
+def test_from_json_not_an_object(tmp_path):
+    p = tmp_path / "list.json"
+    p.write_text('["sk-aaa", "sk-bbb"]')
+
+    with pytest.raises(ValueError, match="Expected a JSON object"):
+        KeyPool.from_json(str(p))
+
+
+def test_from_json_empty_object_raises_runtime_error(tmp_path):
+    p = tmp_path / "empty.json"
+    p.write_text("{}")
+
+    with pytest.raises(RuntimeError, match="empty"):
+        KeyPool.from_json(str(p))
+
+
+def test_from_json_non_string_value_raises_value_error(tmp_path):
+    p = tmp_path / "mixed.json"
+    p.write_text('{"KEY_1": "sk-aaa", "KEY_2": 123}')
+
+    with pytest.raises(ValueError, match="must be strings"):
+        KeyPool.from_json(str(p))
+
+
+def test_from_json_no_suffix_match_raises_runtime_error(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text('{"OTHER_1": "sk-aaa", "OTHER_2": "sk-bbb"}')
+
+    with pytest.raises(RuntimeError, match="No entries"):
+        KeyPool.from_json(str(p), suffix="GROQ")
+
+
+def test_from_json_ignores_empty_values(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text('{"GROQ_KEY": "sk-aaa", "BACKUP_GROQ_KEY": "  ", "OTHER_GROQ_KEY": "sk-ccc"}')
+
+    pool = KeyPool.from_json(str(p), suffix="GROQ_KEY")
+    assert len(pool.status()) == 2
+
+
+def test_from_json_passes_constructor_kwargs(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text('{"GROQ_KEY": "sk-aaa", "BACKUP_GROQ_KEY": "sk-bbb"}')
+
+    pool = KeyPool.from_json(
+        str(p), suffix="GROQ_KEY", max_retries=5, cooldown_seconds=90, strategy="lru"
+    )
+    assert pool.max_retries == 5
+    assert pool.cooldown_seconds == 90
+    assert pool.strategy == "lru"
+
+
+def test_from_json_status_never_contains_raw_key(tmp_path):
+    p = tmp_path / "keys.json"
+    p.write_text('{"GROQ_KEY": "sk-real-secret-key-aaa", "BACKUP_GROQ_KEY": "sk-real-secret-key-bbb"}')
+
+    pool = KeyPool.from_json(str(p), suffix="GROQ_KEY")
+    status_str = str(pool.status())
+    assert "sk-real-secret-key-aaa" not in status_str
+    assert "sk-real-secret-key-bbb" not in status_str

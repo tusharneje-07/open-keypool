@@ -74,6 +74,37 @@ for masked_key, info in pool.status().items():
           f"failures={info['failure_count']}")
 ```
 
+### Load keys from `.env` file
+
+```python
+from open_keypool import KeyPool
+
+# .env contains:
+#   TSN_GROQ_KEY=sk-aaa
+#   BACKUP_GROQ_KEY=sk-bbb
+#   OTHER_SECRET=sk-ccc
+
+pool = KeyPool.from_env(suffix="GROQ_KEY")
+# Picks TSN_GROQ_KEY and BACKUP_GROQ_KEY (ends with "GROQ_KEY")
+```
+
+### Load keys from JSON file
+
+```json
+{
+    "TSN_GROQ_KEY": "sk-aaa",
+    "BACKUP_GROQ_KEY": "sk-bbb",
+    "OTHER_SECRET": "sk-ccc"
+}
+```
+
+```python
+from open_keypool import KeyPool
+
+pool = KeyPool.from_json("keys.json", suffix="GROQ_KEY")
+# Picks TSN_GROQ_KEY and BACKUP_GROQ_KEY (ends with "GROQ_KEY")
+```
+
 ## Constructor parameters
 
 | Parameter | Type | Default | Description |

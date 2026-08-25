@@ -14,6 +14,7 @@ from enum import Enum
 
 import cachetools
 import httpx
+from dotenv import load_dotenv
 
 
 class KeyState(Enum):
@@ -278,6 +279,181 @@ class KeyPool:
 
         return cls(
             keys=fetched_keys,
+            max_retries=max_retries,
+            cooldown_seconds=cooldown_seconds,
+            strategy=strategy,
+        )
+
+    @classmethod
+    def from_env(
+        cls,
+        suffix: str,
+        env_file: str | None = None,
+        max_retries: int = 3,
+        cooldown_seconds: int = 60,
+        strategy: str = "round_robin",
+    ) -> KeyPool:
+        """Create a ``KeyPool`` from environment variables matching a suffix.
+
+        Calls ``python-dotenv``'s ``load_dotenv()`` to load a ``.env`` file
+        (if *env_file* is given or a ``.env`` exists in the current directory),
+        then scans **all** environment variables for names ending with
+        *suffix*. The matching variable values are used as API keys.
+
+        Parameters
+        ----------
+        suffix : str
+            Environment-variable name suffix to match (case-sensitive).
+            For example, ``"GROQ_KEY"`` matches ``TSN_GROQ_KEY``,
+            ``BACKUP_GROQ_KEY``, etc.
+        env_file : str | None, optional
+            Path to a ``.env`` file to load before scanning. ``None``
+            (default) lets ``load_dotenv()`` find ``.env`` automatically.
+        max_retries : int, optional
+            Passed through to the ``KeyPool`` constructor. Default is 3.
+        cooldown_seconds : int, optional
+            Passed through to the ``KeyPool`` constructor. Default is 60.
+        strategy : str, optional
+            Passed through to the ``KeyPool`` constructor.
+            Default is ``"round_robin"``.
+
+        Returns
+        -------
+        KeyPool
+            A new ``KeyPool`` instance populated with matching env values.
+
+        Raises
+        ------
+        ValueError
+            If *suffix* is empty or ``None``.
+        RuntimeError
+            If no environment variables match *suffix*.
+
+        Examples
+        --------
+        >>> # .env contains: TSN_GROQ_KEY_1=sk-abc  TSN_GROQ_KEY_2=sk-def
+        >>> pool = KeyPool.from_env(suffix="GROQ_KEY")
+        """
+        if not suffix:
+            raise ValueError("suffix must be a non-empty string.")
+
+        load_dotenv(env_file)
+
+        import os
+
+        matched: list[str] = []
+        for name, value in os.environ.items():
+            if name.endswith(suffix) and value.strip():
+                matched.append(value.strip())
+
+        if not matched:
+            raise RuntimeError(
+                f"No environment variables ending with '{suffix}' found "
+                f"(env_file={env_file!r})."
+            )
+
+        return cls(
+            keys=matched,
+            max_retries=max_retries,
+            cooldown_seconds=cooldown_seconds,
+            strategy=strategy,
+        )
+
+    @classmethod
+    def from_json(
+        cls,
+        path: str,
+        suffix: str | None = None,
+        max_retries: int = 3,
+        cooldown_seconds: int = 60,
+        strategy: str = "round_robin",
+    ) -> KeyPool:
+        """Create a ``KeyPool`` from a JSON file.
+
+        The JSON file must contain a **flat object** whose values are the
+        API key strings. Only entries whose *key name* ends with *suffix*
+        are included (if *suffix* is ``None``, all entries are used).
+
+        Expected JSON format::
+
+            {
+                "TSN_GROQ_KEY_1": "sk-abc123",
+                "TSN_GROQ_KEY_2": "sk-def456",
+                "OTHER_SECRET":   "sk-ghi789"
+            }
+
+        Parameters
+        ----------
+        path : str
+            Path to the JSON file.
+        suffix : str | None, optional
+            If provided, only entries whose key name ends with this string
+            are included. ``None`` (default) includes all entries.
+        max_retries : int, optional
+            Passed through to the ``KeyPool`` constructor. Default is 3.
+        cooldown_seconds : int, optional
+            Passed through to the ``KeyPool`` constructor. Default is 60.
+        strategy : str, optional
+            Passed through to the ``KeyPool`` constructor.
+            Default is ``"round_robin"``.
+
+        Returns
+        -------
+        KeyPool
+            A new ``KeyPool`` instance populated with matching JSON values.
+
+        Raises
+        ------
+        FileNotFoundError
+            If *path* does not exist.
+        ValueError
+            If the file is not valid JSON or is not a flat object.
+        RuntimeError
+            If no entries match *suffix* (or the object is empty).
+
+        Examples
+        --------
+        >>> # keys.json: {"GROQ_1": "sk-abc", "GROQ_2": "sk-def", "OTHER": "sk-ghi"}
+        >>> pool = KeyPool.from_json("keys.json", suffix="GROQ")
+        """
+        import json as _json
+        import os
+
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"JSON file not found: {path}")
+
+        with open(path, "r", encoding="utf-8") as fh:
+            try:
+                data = _json.load(fh)
+            except _json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Expected a JSON object at top level in {path}, got {type(data).__name__}."
+            )
+
+        if not data:
+            raise RuntimeError(f"JSON object in {path} is empty.")
+
+        matched: list[str] = []
+        for name, value in data.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"All values must be strings in {path}. "
+                    f"Key '{name}' has type {type(value).__name__}."
+                )
+            if suffix is None or name.endswith(suffix):
+                if value.strip():
+                    matched.append(value.strip())
+
+        if not matched:
+            raise RuntimeError(
+                f"No entries ending with '{suffix}' found in {path}."
+            )
+
+        return cls(
+            keys=matched,
             max_retries=max_retries,
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
