@@ -1,6 +1,6 @@
 [project]
 name = "open-keypool"
-version = "0.1.0"
+version = "0.2.0"
 description = "Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-limit errors."
 readme = "README.md"
 license = { file = "LICENSE" }
