@@ -121,4 +121,27 @@ Pass `force_refresh=True` to bypass the cache and re-fetch immediately (useful a
 
 ## Full API reference
 
-[docs/index.html](https://github.com/tusharneje-07/open-keypool/blob/main/docs/index.html) — self-contained HTML page with quickstart + class/method documentation generated from docstrings.
+Read [Docs](https://tusharneje.in/projects/open-keypool/).
+
+## Contributing
+
+Contributions are welcome. If you have an idea, find a bug, or want to improve `open-keypool`, feel free to contribute.
+
+### How to Contribute
+
+1. Fork the repository.
+2. Create a new branch for your changes.
+3. Make your changes and add appropriate tests.
+4. Run the test suite and make sure all tests pass.
+5. Commit your changes with a clear message.
+6. Open a Pull Request describing what you changed and why.
+
+Please keep contributions focused on the core goal of `open-keypool`: **simple and reliable API key pooling and rotation**.
+
+For larger changes or new features, open an issue first so the approach can be discussed before implementation.
+
+## License
+
+`open-keypool` is released under the [MIT License](LICENSE).
+
+See the `LICENSE` file for the full license text.
