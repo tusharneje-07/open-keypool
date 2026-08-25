@@ -26,6 +26,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tusharneje-07/open-keypool"
+Repository = "https://github.com/tusharneje-07/open-keypool"
+Documentation = "https://github.com/tusharneje-07/open-keypool/blob/main/docs/index.html"
+"Bug Tracker" = "https://github.com/tusharneje-07/open-keypool/issues"
+
 [project.optional-dependencies]
 dev = [
     "pdoc>=15.0.0",

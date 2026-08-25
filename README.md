@@ -1,12 +1,11 @@
 # open-keypool
 
-Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-limit errors. Provide a list of keys (or pull them from Doppler), choose a rotation strategy (round-robin or least-recently-used), and the pool handles cooldown on rate-limit responses and permanent disablement on invalid keys — all thread-safe.
+Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-limit errors. Provide a list of keys (or pull them from Doppler, `.env`, or JSON), choose a rotation strategy (round-robin or least-recently-used), and the pool handles cooldown on rate-limit responses and permanent disablement on invalid keys — all thread-safe.
 
 ## Install
 
 ```bash
-# From TestPyPI (until published on PyPI):
-pip install --index-url https://test.pypi.org/simple/ open-keypool
+pip install open-keypool
 ```
 
 ## Quickstart
@@ -50,7 +49,7 @@ for attempt in range(pool.max_retries):
 
 Returns `KeyState` so you can branch on the result.
 
-### Multi-key Doppler pool with status tracking
+### Load keys from Doppler
 
 ```python
 import os
@@ -122,4 +121,4 @@ Pass `force_refresh=True` to bypass the cache and re-fetch immediately (useful a
 
 ## Full API reference
 
-[docs/index.html](docs/index.html) — self-contained HTML page with quickstart + class/method documentation generated from docstrings.
+[docs/index.html](https://github.com/tusharneje-07/open-keypool/blob/main/docs/index.html) — self-contained HTML page with quickstart + class/method documentation generated from docstrings.
