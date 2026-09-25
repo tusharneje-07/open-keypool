@@ -2,9 +2,9 @@
 
 Avoids HTTP 429 rate-limit errors by cycling through a pool of keys with
 cooldown and disablement support. Provide a list of keys (or pull them from
-Doppler), choose a rotation strategy (round-robin or least-recently-used),
-and the pool handles cooldown on rate-limit responses and permanent
-disablement on invalid keys — all thread-safe.
+Doppler, AWS, GCP, .env, or JSON), choose a rotation strategy (round-robin or
+least-recently-used), and the pool handles cooldown on rate-limit responses and
+permanent disablement on invalid keys — all thread-safe and async-compatible.
 
 Install
 -------
@@ -12,44 +12,38 @@ Install
 
     pip install open-keypool
 
-Quickstart — Local keys array
------------------------------
+Quickstart — High-level pool.call()
+-----------------------------------
 .. code-block:: python
 
-    from open_keypool import KeyPool, AllKeysExhaustedError
-
-    pool = KeyPool(keys=["sk-key1", "sk-key2", "sk-key3"], strategy="round_robin")
-
-    for attempt in range(pool.max_retries):
-        key = pool.get_key()
-        response = call_your_api(key)
-        if response.status_code == 429:
-            retry_after = float(response.headers.get("Retry-After", 0))
-            pool.mark_rate_limited(key, retry_after=retry_after or None)
-        elif response.status_code in (401, 403):
-            pool.mark_invalid(key)
-        else:
-            pool.mark_success(key)
-            break
-
-Quickstart — Doppler
---------------------
-.. code-block:: python
-
-    import os
+    import httpx
     from open_keypool import KeyPool
 
-    DOPPLER_TOKEN = os.getenv("DOPPLER_TOKEN", "dp.st.YOUR_SERVICE_TOKEN")
-    PROJECT_NAME = "refactor-ai"
-    CONFIG_NAME = "dev"
+    pool = KeyPool(keys=["sk-key1", "sk-key2"], provider="groq")
 
-    pool = KeyPool.from_doppler(
-        token=DOPPLER_TOKEN,
-        project=PROJECT_NAME,
-        config=CONFIG_NAME,
-        key_prefix="MY_APP_",
-        strategy="lru",
-    )
+    def fetch_models(key):
+        return httpx.get("https://api.groq.com/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    response = pool.call(fetch_models)
+
+Quickstart — AsyncKeyPool
+-------------------------
+.. code-block:: python
+
+    import httpx
+    import asyncio
+    from open_keypool import AsyncKeyPool
+
+    async def main():
+        pool = AsyncKeyPool(keys=["sk-key1", "sk-key2"], provider="openai")
+
+        async def fetch_models(key):
+            async with httpx.AsyncClient() as client:
+                return await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+        response = await pool.call(fetch_models)
+
+    asyncio.run(main())
 """
 
 from open_keypool.core import AllKeysExhaustedError, AsyncKeyPool, KeyPool, KeyState

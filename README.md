@@ -10,7 +10,52 @@ pip install open-keypool
 
 ## Quickstart
 
-### Local keys array
+### High-level pool.call() (Recommended)
+
+`pool.call(fn, *args, **kwargs)` runs the `get_key → fn → handle_response` loop automatically:
+
+```python
+import httpx
+from open_keypool import KeyPool
+
+pool = KeyPool(keys=["sk-key1", "sk-key2", "sk-key3"], provider="groq")
+
+# Collapses execution down to 3 lines with automatic key rotation and retries:
+def fetch_chat(key):
+    return httpx.get("https://api.groq.com/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+response = pool.call(fetch_chat)
+```
+
+### Async Usage (`AsyncKeyPool`)
+
+```python
+import httpx
+import asyncio
+from open_keypool import AsyncKeyPool
+
+async def main():
+    pool = AsyncKeyPool(keys=["sk-key1", "sk-key2"], provider="openai")
+
+    async def fetch_models(key):
+        async with httpx.AsyncClient() as client:
+            return await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {key}"})
+
+    response = await pool.call(fetch_models)
+
+asyncio.run(main())
+```
+
+### Provider Presets
+
+Pre-configure how response rate-limit headers and error structures are handled (`"groq"`, `"openai"`, `"gemini"`, `"together"`):
+
+```python
+pool = KeyPool(keys=["sk-groq-1", "sk-groq-2"], provider="groq")
+# Automatically handles Groq rate limit headers (x-ratelimit-reset-requests, etc.)
+```
+
+### Manual rotation loop
 
 ```python
 from open_keypool import KeyPool, AllKeysExhaustedError, KeyState
@@ -78,30 +123,27 @@ for masked_key, info in pool.status().items():
 ```python
 from open_keypool import KeyPool
 
-# .env contains:
-#   TSN_GROQ_KEY=sk-aaa
-#   BACKUP_GROQ_KEY=sk-bbb
-#   OTHER_SECRET=sk-ccc
-
 pool = KeyPool.from_env(suffix="GROQ_KEY")
-# Picks TSN_GROQ_KEY and BACKUP_GROQ_KEY (ends with "GROQ_KEY")
 ```
 
 ### Load keys from JSON file
-
-```json
-{
-    "TSN_GROQ_KEY": "sk-aaa",
-    "BACKUP_GROQ_KEY": "sk-bbb",
-    "OTHER_SECRET": "sk-ccc"
-}
-```
 
 ```python
 from open_keypool import KeyPool
 
 pool = KeyPool.from_json("keys.json", suffix="GROQ_KEY")
-# Picks TSN_GROQ_KEY and BACKUP_GROQ_KEY (ends with "GROQ_KEY")
+```
+
+### Load keys from AWS Secrets Manager or GCP Secret Manager
+
+```python
+from open_keypool import KeyPool
+
+# AWS Secrets Manager (requires open-keypool[aws] or boto3)
+aws_pool = KeyPool.from_aws_secrets("my-app-secrets", key_prefix="GROQ_")
+
+# GCP Secret Manager (requires open-keypool[gcp] or google-cloud-secret-manager)
+gcp_pool = KeyPool.from_gcp_secrets("my-app-secrets", project_id="my-project", key_prefix="GROQ_")
 ```
 
 ## Constructor parameters
@@ -112,6 +154,7 @@ pool = KeyPool.from_json("keys.json", suffix="GROQ_KEY")
 | `max_retries` | `int` | `3` | Max retry count reference for the caller's loop. |
 | `cooldown_seconds` | `int` | `60` | How long a rate-limited key stays in cooldown. |
 | `strategy` | `str` | `"round_robin"` | Rotation strategy: `"round_robin"` or `"lru"`. |
+| `provider` | `str` | `None` | Provider preset: `"groq"`, `"openai"`, `"gemini"`, `"together"`. |
 
 ## Doppler caching
 
