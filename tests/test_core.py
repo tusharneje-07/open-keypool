@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 import open_keypool.core as core
@@ -700,6 +701,9 @@ def test_from_env_loads_matching_env_vars(monkeypatch, tmp_path):
     keys = {pool.get_key() for _ in range(10)}
     assert keys == {"sk-aaa", "sk-bbb"}
 
+    monkeypatch.delenv("TSN_GROQ_KEY", raising=False)
+    monkeypatch.delenv("BACKUP_GROQ_KEY", raising=False)
+
 
 def test_from_env_no_match_raises_runtime_error(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
@@ -726,6 +730,7 @@ def test_from_env_ignores_empty_values(monkeypatch, tmp_path):
     monkeypatch.delenv("GROQ_KEY", raising=False)
     monkeypatch.delenv("BACKUP_GROQ_KEY", raising=False)
     monkeypatch.delenv("OTHER_GROQ_KEY", raising=False)
+    monkeypatch.delenv("TSN_GROQ_KEY", raising=False)
 
     pool = KeyPool.from_env(suffix="GROQ_KEY", env_file=str(env_file))
     assert len(pool.status()) == 2
@@ -837,3 +842,45 @@ def test_from_json_status_never_contains_raw_key(tmp_path):
     status_str = str(pool.status())
     assert "sk-real-secret-key-aaa" not in status_str
     assert "sk-real-secret-key-bbb" not in status_str
+
+
+# ---------------------------------------------------------------------------
+# Section 1 Fixes Tests
+# ---------------------------------------------------------------------------
+
+
+def test_doppler_cache_key_includes_token(respx_mock):
+    _DOPPLER_CACHE.clear()
+    respx_mock.get(core._DOPPLER_DOWNLOAD_URL).mock(
+        return_value=httpx.Response(200, json={"secrets": {"K1": {"raw": "token1-key"}}})
+    )
+    pool1 = KeyPool.from_doppler(token="token1", project="p", config="c")
+    assert pool1.get_key() == "token1-key"
+
+    respx_mock.get(core._DOPPLER_DOWNLOAD_URL).mock(
+        return_value=httpx.Response(200, json={"secrets": {"K1": {"raw": "token2-key"}}})
+    )
+    pool2 = KeyPool.from_doppler(token="token2", project="p", config="c")
+    assert pool2.get_key() == "token2-key"
+
+
+def test_status_masked_key_collision():
+    # Two distinct keys that mask to the exact same string
+    raw_key1 = "sk-abc11111234"
+    raw_key2 = "sk-abc22221234"
+    assert mask(raw_key1) == mask(raw_key2)
+
+    pool = KeyPool(keys=[raw_key1, raw_key2])
+    st = pool.status()
+    assert len(st) == 2
+    keys = list(st.keys())
+    assert keys[0] == mask(raw_key1)
+    assert keys[1] == f"{mask(raw_key2)}#2"
+
+
+def test_from_env_missing_dotenv_raises_importerror(monkeypatch, tmp_path):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "dotenv", None)
+    with pytest.raises(ImportError, match="python-dotenv is required to use KeyPool.from_env"):
+        KeyPool.from_env(suffix="GROQ_KEY", env_file=str(tmp_path / ".env"))

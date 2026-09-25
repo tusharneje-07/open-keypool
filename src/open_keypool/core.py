@@ -14,7 +14,6 @@ from enum import Enum
 
 import cachetools
 import httpx
-from dotenv import load_dotenv
 
 
 class KeyState(Enum):
@@ -234,7 +233,7 @@ class KeyPool:
         ...     key_prefix="API_KEY_",
         ... )
         """
-        cache_key = (project, config, key_prefix)
+        cache_key = (token, project, config, key_prefix)
 
         if not force_refresh:
             cached = _DOPPLER_CACHE.get(cache_key)
@@ -336,6 +335,14 @@ class KeyPool:
         """
         if not suffix:
             raise ValueError("suffix must be a non-empty string.")
+
+        try:
+            from dotenv import load_dotenv
+        except ImportError as exc:
+            raise ImportError(
+                "python-dotenv is required to use KeyPool.from_env(). "
+                "Install it with `pip install open-keypool[env]`."
+            ) from exc
 
         load_dotenv(env_file)
 
@@ -822,7 +829,14 @@ class KeyPool:
                     remaining = max(0.0, rec.cooldown_until - now)
                 else:
                     remaining = None
-                result[mask(rec.key)] = {
+                masked_key = mask(rec.key)
+                if masked_key in result:
+                    suffix_num = 2
+                    while f"{masked_key}#{suffix_num}" in result:
+                        suffix_num += 1
+                    masked_key = f"{masked_key}#{suffix_num}"
+
+                result[masked_key] = {
                     "state": rec.state.value,
                     "failure_count": rec.failure_count,
                     "cooldown_remaining": round(remaining, 1) if remaining is not None else None,
