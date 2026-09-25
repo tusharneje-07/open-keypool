@@ -154,7 +154,7 @@ class KeyState(Enum):
     DISABLED = "disabled"
 
 
-@dataclass(slots=True)
+@dataclass
 class _KeyRecord:
     """Internal representation of a single API key and its health metadata."""
 
