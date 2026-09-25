@@ -35,6 +35,17 @@ Documentation = "https://tusharneje.in/projects/open-keypool/"
 env = [
     "python-dotenv>=1.0.0",
 ]
+aws = [
+    "boto3>=1.26.0",
+]
+gcp = [
+    "google-cloud-secret-manager>=2.16.0",
+]
+all = [
+    "python-dotenv>=1.0.0",
+    "boto3>=1.26.0",
+    "google-cloud-secret-manager>=2.16.0",
+]
 dev = [
     "pdoc>=15.0.0",
     "pytest>=8.0.0",

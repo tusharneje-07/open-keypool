@@ -11,6 +11,7 @@ import pytest
 import open_keypool.core as core
 from open_keypool.core import (
     AllKeysExhaustedError,
+    AsyncKeyPool,
     KeyPool,
     KeyState,
     _DOPPLER_CACHE,
@@ -884,3 +885,144 @@ def test_from_env_missing_dotenv_raises_importerror(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "dotenv", None)
     with pytest.raises(ImportError, match="python-dotenv is required to use KeyPool.from_env"):
         KeyPool.from_env(suffix="GROQ_KEY", env_file=str(tmp_path / ".env"))
+
+
+# ---------------------------------------------------------------------------
+# Section 2 Features Tests
+# ---------------------------------------------------------------------------
+
+
+def test_provider_preset_groq():
+    pool = KeyPool(keys=["k1", "k2"], provider="groq")
+    # Rate limit with x-ratelimit-reset-requests header
+    state = pool.handle_response("k1", 429, headers={"x-ratelimit-reset-requests": "10s"})
+    assert state == KeyState.COOLDOWN
+    assert pool.get_key() == "k2"
+
+
+def test_provider_preset_openai():
+    pool = KeyPool(keys=["k1", "k2"], provider="openai")
+    state = pool.handle_response("k1", 429, headers={"retry-after-ms": "5000"}, body={"error": {"code": "rate_limit_exceeded"}})
+    assert state == KeyState.COOLDOWN
+    assert pool.get_key() == "k2"
+
+
+def test_provider_preset_gemini():
+    pool = KeyPool(keys=["k1", "k2"], provider="gemini")
+    state = pool.handle_response("k1", 429, body={"error": {"status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}})
+    assert state == KeyState.COOLDOWN
+    assert pool.get_key() == "k2"
+
+
+def test_provider_preset_together():
+    pool = KeyPool(keys=["k1", "k2"], provider="together")
+    state = pool.handle_response("k1", 429, body={"error": {"type": "rate_limit_error"}})
+    assert state == KeyState.COOLDOWN
+    assert pool.get_key() == "k2"
+
+
+def test_pool_call_success():
+    pool = KeyPool(keys=["k1", "k2"], max_retries=3)
+
+    def dummy_api(key, prompt):
+        return {"result": f"hello {prompt} with {key}"}
+
+    res = pool.call(dummy_api, "world")
+    assert res == {"result": "hello world with k1"}
+
+
+def test_pool_call_retries_on_rate_limit():
+    pool = KeyPool(keys=["k1", "k2"], max_retries=3)
+    attempts = []
+
+    def dummy_api(key):
+        attempts.append(key)
+        if key == "k1":
+            return httpx.Response(429, headers={"Retry-After": "60"}, json={"error": {"code": "rate_limit_exceeded"}})
+        return httpx.Response(200, json={"data": "ok"})
+
+    res = pool.call(dummy_api)
+    assert res.status_code == 200
+    assert attempts == ["k1", "k2"]
+
+
+def test_pool_call_raises_exhausted():
+    pool = KeyPool(keys=["k1"], max_retries=1)
+
+    def dummy_api(key):
+        return httpx.Response(429, headers={"Retry-After": "60"})
+
+    with pytest.raises(AllKeysExhaustedError):
+        pool.call(dummy_api)
+
+
+@pytest.mark.anyio
+async def test_async_keypool_basic():
+    pool = AsyncKeyPool(keys=["k1", "k2"], strategy="round_robin")
+    k1 = await pool.get_key()
+    assert k1 == "k1"
+    k2 = await pool.async_get_key()
+    assert k2 == "k2"
+
+    await pool.mark_rate_limited("k1", retry_after=60)
+    st = await pool.status()
+    assert st[mask("k1")]["state"] == "cooldown"
+
+    async def async_fn(key):
+        return f"async-{key}"
+
+    res = await pool.call(async_fn)
+    assert res == "async-k2"
+
+
+@pytest.mark.anyio
+async def test_async_keypool_from_doppler(respx_mock):
+    respx_mock.get(core._DOPPLER_DOWNLOAD_URL).mock(
+        return_value=httpx.Response(200, json={"secrets": {"KEY1": {"raw": "secret-1"}}})
+    )
+    pool = await AsyncKeyPool.from_doppler(token="async-token", project="p", config="c")
+    assert await pool.get_key() == "secret-1"
+
+
+def test_from_aws_secrets_mocked():
+    class DummyClient:
+        def get_secret_value(self, SecretId):
+            return {"SecretString": '{"K1": "aws-key-1", "K2": "aws-key-2"}'}
+
+    class DummyBoto3:
+        def client(self, service, **kwargs):
+            return DummyClient()
+
+    import sys
+    sys.modules["boto3"] = DummyBoto3()
+
+    pool = KeyPool.from_aws_secrets("my-secret", key_prefix="K")
+    assert pool.get_key() == "aws-key-1"
+    assert pool.get_key() == "aws-key-2"
+
+
+def test_from_gcp_secrets_mocked():
+    class DummyPayload:
+        data = b'{"GCP_KEY_1": "gcp-val-1", "GCP_KEY_2": "gcp-val-2"}'
+
+    class DummyVersionResponse:
+        payload = DummyPayload()
+
+    class DummyGCPClient:
+        def access_secret_version(self, request):
+            return DummyVersionResponse()
+
+    class DummyGCPSecretManager:
+        SecretManagerServiceClient = DummyGCPClient
+
+    import sys
+    class DummyGoogleCloud:
+        secretmanager = DummyGCPSecretManager
+    sys.modules["google"] = DummyGoogleCloud()
+    sys.modules["google.cloud"] = DummyGoogleCloud()
+    sys.modules["google.cloud.secretmanager"] = DummyGCPSecretManager()
+
+    pool = KeyPool.from_gcp_secrets("my-secret", project_id="my-proj", key_prefix="GCP_KEY")
+    assert pool.get_key() == "gcp-val-1"
+    assert pool.get_key() == "gcp-val-2"
+

@@ -52,6 +52,6 @@ Quickstart — Doppler
     )
 """
 
-from open_keypool.core import AllKeysExhaustedError, KeyPool, KeyState
+from open_keypool.core import AllKeysExhaustedError, AsyncKeyPool, KeyPool, KeyState
 
-__all__ = ["KeyPool", "AllKeysExhaustedError", "KeyState"]
+__all__ = ["KeyPool", "AsyncKeyPool", "AllKeysExhaustedError", "KeyState"]
