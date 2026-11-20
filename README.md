@@ -8,6 +8,8 @@
 
 Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-limit errors. Provide a list of keys (or pull them from Doppler, `.env`, or JSON), choose a rotation strategy (round-robin or least-recently-used), and the pool handles cooldown on rate-limit responses and permanent disablement on invalid keys — all thread-safe.
 
+**Current release: v0.4.0**
+
 ## Install
 
 ```bash
