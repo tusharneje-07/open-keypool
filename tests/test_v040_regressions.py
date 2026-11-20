@@ -6,6 +6,7 @@ import pytest
 
 from open_keypool import AllKeysExhaustedError, AsyncKeyPool, KeyPool, KeyState
 from open_keypool.core import mask
+from open_keypool.httpx_auth import KeyPoolAuth
 
 
 def test_client_error_stays_active_and_is_returned_without_rotating():
@@ -73,3 +74,46 @@ def test_wait_for_recovery_does_not_consume_retry(monkeypatch):
     monkeypatch.setattr(pool, "get_key", get_key)
     assert pool.call(lambda key: "ok") == "ok"
     assert sleeps == [pytest.approx(2)]
+
+
+def test_httpx_auth_rotates_on_rate_limit():
+    pool = KeyPool(["key-a", "key-b"], max_retries=2)
+
+    def handler(request):
+        if request.headers["Authorization"] == "Bearer key-a":
+            return httpx.Response(429, request=request, json={"error": {"code": "rate_limit_exceeded"}})
+        return httpx.Response(200, request=request, json={"ok": True})
+
+    with httpx.Client(transport=httpx.MockTransport(handler), auth=KeyPoolAuth(pool)) as client:
+        response = client.get("https://example.test")
+    assert response.status_code == 200
+
+
+def test_httpx_auth_rejects_sync_async_mismatch():
+    with pytest.raises(TypeError, match="synchronous KeyPool"):
+        list(KeyPoolAuth(AsyncKeyPool(["key-a"])).auth_flow(httpx.Request("GET", "https://example.test")))
+
+
+def test_callbacks_are_masked_and_callback_errors_are_isolated(caplog):
+    events = []
+    raw = "sk-callback-secret-12345"
+    pool = KeyPool(
+        [raw],
+        on_cooldown=lambda key, seconds, reason: events.append((key, reason)),
+    )
+    with caplog.at_level(logging.INFO, logger="open_keypool"):
+        pool.handle_response(raw, 429, body={"error": {"message": raw}})
+    assert events[0][0] == mask(raw)
+    assert raw not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_async_callback_can_be_awaited():
+    events = []
+
+    async def callback(key, reason):
+        events.append((key, reason))
+
+    pool = AsyncKeyPool(["key-a"], on_disabled=callback)
+    await pool.handle_response("key-a", 401)
+    assert events == [(mask("key-a"), "401")]

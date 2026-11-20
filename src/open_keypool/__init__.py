@@ -46,6 +46,13 @@ Quickstart — AsyncKeyPool
     asyncio.run(main())
 """
 
-from open_keypool.core import AllKeysExhaustedError, AsyncKeyPool, KeyPool, KeyState
+import logging
 
-__all__ = ["KeyPool", "AsyncKeyPool", "AllKeysExhaustedError", "KeyState"]
+from open_keypool.core import AllKeysExhaustedError, AsyncKeyPool, KeyPool, KeyState
+from open_keypool.httpx_auth import KeyPoolAuth
+
+logging.getLogger("open_keypool").addHandler(logging.NullHandler())
+
+__version__ = "0.4.0"
+
+__all__ = ["KeyPool", "AsyncKeyPool", "KeyPoolAuth", "AllKeysExhaustedError", "KeyState"]
