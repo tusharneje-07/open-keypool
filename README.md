@@ -160,7 +160,7 @@ gcp_pool = KeyPool.from_gcp_secrets("my-app-secrets", project_id="my-project", k
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `keys` | `list[str]` | *required* | Initial API key strings (non-empty). |
-| `max_retries` | `int` | `3` | Max retry count reference for the caller's loop. |
+| `max_retries` | `int` | `3` | Maximum attempts made by `call()` and `KeyPoolAuth` when rotating keys. |
 | `cooldown_seconds` | `int` | `60` | How long a rate-limited key stays in cooldown. |
 | `strategy` | `str` | `"round_robin"` | Rotation strategy: `"round_robin"` or `"lru"`. |
 | `provider` | `str` | `None` | Provider preset: `"groq"`, `"openai"`, `"gemini"`, `"together"`, `"openrouter"`, `"cerebras"`, `"mistral"`, or `"anthropic"`. |

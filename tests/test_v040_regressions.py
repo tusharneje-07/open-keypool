@@ -1,6 +1,8 @@
 import asyncio
 import inspect
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -108,6 +110,25 @@ def test_callbacks_are_masked_and_callback_errors_are_isolated(caplog):
     assert raw not in caplog.text
 
 
+def test_direct_state_changes_and_get_key_exhaustion_fire_callbacks():
+    cooldown_events = []
+    disabled_events = []
+    exhausted_events = []
+    pool = KeyPool(
+        ["key-a"],
+        on_cooldown=lambda *event: cooldown_events.append(event),
+        on_disabled=lambda *event: disabled_events.append(event),
+        on_exhausted=lambda message: exhausted_events.append(message),
+    )
+    pool.mark_rate_limited("key-a", retry_after=10)
+    assert cooldown_events[0][0] == mask("key-a")
+    pool.mark_invalid("key-a", error_message="invalid")
+    assert disabled_events[0][0] == mask("key-a")
+    with pytest.raises(AllKeysExhaustedError):
+        pool.get_key()
+    assert exhausted_events
+
+
 @pytest.mark.anyio
 async def test_async_callback_can_be_awaited():
     events = []
@@ -118,6 +139,43 @@ async def test_async_callback_can_be_awaited():
     pool = AsyncKeyPool(["key-a"], on_disabled=callback)
     await pool.handle_response("key-a", 401)
     assert events == [(mask("key-a"), "401")]
+
+
+@pytest.mark.anyio
+async def test_httpx_async_auth_reads_response_body_from_real_server():
+    tried = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            tried.append(self.headers.get("Authorization"))
+            if len(tried) == 1:
+                body = b'{"error": {"code": "rate_limit_exceeded"}}'
+                status = 429
+            else:
+                body = b'{"ok": true}'
+                status = 200
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        pool = AsyncKeyPool(["key-a", "key-b"])
+        async with httpx.AsyncClient(auth=KeyPoolAuth(pool)) as client:
+            response = await client.get(f"http://127.0.0.1:{server.server_port}/")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert tried == ["Bearer key-a", "Bearer key-b"]
+    finally:
+        server.shutdown()
+        thread.join()
 
 
 @pytest.mark.parametrize(

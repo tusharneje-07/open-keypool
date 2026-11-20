@@ -5,6 +5,13 @@ All notable changes to `open-keypool` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-20
+
+### Fixed
+- Fixed `KeyPoolAuth` with `httpx.AsyncClient` by reading streaming response bodies before parsing them.
+- Ensured lifecycle callbacks fire for direct state changes and direct pool exhaustion, outside pool locks.
+- Clarified that `max_retries` controls attempts made by `call()` and `KeyPoolAuth`.
+
 ## [0.4.0] - 2026-11-20
 
 ### Added

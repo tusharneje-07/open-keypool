@@ -221,9 +221,8 @@ class KeyPool:
     keys : list[str]
         Initial list of API key strings. At least one key is required.
     max_retries : int, optional
-        Maximum number of retries the caller should attempt per operation.
-        Stored as ``self.max_retries`` for the caller's reference; the library
-        does not perform automatic retries. Default is 3.
+        Maximum attempts made by ``call()`` and ``KeyPoolAuth`` while rotating
+        through keys. Default is 3.
     cooldown_seconds : int, optional
         Number of seconds a key stays in COOLDOWN after being rate-limited
         before it becomes ACTIVE again. Default is 60.
@@ -691,6 +690,8 @@ class KeyPool:
         >>> key = pool.get_key()
         >>> pool.mark_success(key)
         """
+        exhausted: AllKeysExhaustedError | None = None
+        rec: _KeyRecord | None = None
         with self._lock:
             self._recover_cooldown_keys()
             active = self._active_records()
@@ -704,24 +705,31 @@ class KeyPool:
                         default=None,
                     )
                     if soonest is not None and soonest > 0:
-                        raise AllKeysExhaustedError(
+                        exhausted = AllKeysExhaustedError(
                             f"No active keys available. Recovery in {soonest:.1f}s "
                             f"({self._cooldown_summary(cooldown_records, now)})."
                         )
                     else:
-                        raise AllKeysExhaustedError(
+                        exhausted = AllKeysExhaustedError(
                             "No active keys available. All keys are in cooldown or disabled."
                         )
-                raise AllKeysExhaustedError("No active keys available. All keys are disabled.")
+                else:
+                    exhausted = AllKeysExhaustedError("No active keys available. All keys are disabled.")
 
-            if self.strategy == "round_robin":
-                self._round_robin_index %= len(active)
-                rec = active[self._round_robin_index]
-                self._round_robin_index += 1
-            else:  # lru
-                rec = min(active, key=lambda r: r.last_used)
-                rec.last_used = time.monotonic()
+            if exhausted is None:
+                if self.strategy == "round_robin":
+                    self._round_robin_index %= len(active)
+                    rec = active[self._round_robin_index]
+                    self._round_robin_index += 1
+                else:  # lru
+                    rec = min(active, key=lambda r: r.last_used)
+                    rec.last_used = time.monotonic()
 
+        if exhausted is not None:
+            self._invoke_callback(self.on_exhausted, self._safe_message(str(exhausted)))
+            logger.warning("key pool exhausted")
+            raise exhausted
+        assert rec is not None
         logger.debug("rotating to key %s", mask(rec.key))
         return rec.key
 
@@ -938,16 +946,21 @@ class KeyPool:
         >>> pool.mark_rate_limited("key-a", error_code="rate_limit_exceeded",
         ...                        error_message="TPM limit 8000 exceeded")
         """
+        callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
         with self._lock:
             rec = self._find_record(key)
             if rec is None:
                 return
+            duration = retry_after if retry_after is not None else self.cooldown_seconds
             rec.state = KeyState.COOLDOWN
-            rec.cooldown_until = time.monotonic() + (retry_after if retry_after is not None else self.cooldown_seconds)
+            rec.cooldown_until = time.monotonic() + duration
             rec.failure_count += 1
             rec.last_error_code = error_code
             rec.last_error_message = self._safe_message(error_message or "") or None
-            logger.info("key %s entered cooldown for %.1fs", mask(rec.key), retry_after if retry_after is not None else self.cooldown_seconds)
+            callback = (self.on_cooldown, (mask(rec.key), duration, self._safe_message(error_message or error_code or "manual")))
+        if callback is not None:
+            self._invoke_callback(callback[0], *callback[1])
+        logger.info("key %s entered cooldown for %.1fs", mask(key), duration)
 
     def mark_invalid(
         self,
@@ -975,6 +988,7 @@ class KeyPool:
         >>> pool.mark_invalid("key-a")
         >>> pool.mark_invalid("key-a", error_code="401", error_message="Invalid API key")
         """
+        callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
         with self._lock:
             rec = self._find_record(key)
             if rec is None:
@@ -982,7 +996,10 @@ class KeyPool:
             rec.state = KeyState.DISABLED
             rec.last_error_code = error_code
             rec.last_error_message = self._safe_message(error_message or "") or None
-            logger.info("key %s disabled", mask(rec.key))
+            callback = (self.on_disabled, (mask(rec.key), self._safe_message(error_message or error_code or "manual")))
+        if callback is not None:
+            self._invoke_callback(callback[0], *callback[1])
+        logger.info("key %s disabled", mask(key))
 
     def mark_success(self, key: str) -> None:
         """Reset a key's failure count to 0 and keep it ACTIVE.
@@ -1156,6 +1173,8 @@ class AsyncKeyPool:
             logger.error("open_keypool callback failed: %s", self._safe_message(str(exc)))
 
     async def get_key(self) -> str:
+        exhausted: AllKeysExhaustedError | None = None
+        rec: _KeyRecord | None = None
         async with self._get_lock():
             self._recover_cooldown_keys()
             active = self._active_records()
@@ -1169,24 +1188,31 @@ class AsyncKeyPool:
                         default=None,
                     )
                     if soonest is not None and soonest > 0:
-                        raise AllKeysExhaustedError(
+                        exhausted = AllKeysExhaustedError(
                             f"No active keys available. Recovery in {soonest:.1f}s "
                             f"({self._cooldown_summary(cooldown_records, now)})."
                         )
                     else:
-                        raise AllKeysExhaustedError(
+                        exhausted = AllKeysExhaustedError(
                             "No active keys available. All keys are in cooldown or disabled."
                         )
-                raise AllKeysExhaustedError("No active keys available. All keys are disabled.")
+                else:
+                    exhausted = AllKeysExhaustedError("No active keys available. All keys are disabled.")
 
-            if self.strategy == "round_robin":
-                self._round_robin_index %= len(active)
-                rec = active[self._round_robin_index]
-                self._round_robin_index += 1
-            else:  # lru
-                rec = min(active, key=lambda r: r.last_used)
-                rec.last_used = time.monotonic()
+            if exhausted is None:
+                if self.strategy == "round_robin":
+                    self._round_robin_index %= len(active)
+                    rec = active[self._round_robin_index]
+                    self._round_robin_index += 1
+                else:  # lru
+                    rec = min(active, key=lambda r: r.last_used)
+                    rec.last_used = time.monotonic()
 
+        if exhausted is not None:
+            await self._invoke_callback(self.on_exhausted, self._safe_message(str(exhausted)))
+            logger.warning("key pool exhausted")
+            raise exhausted
+        assert rec is not None
         logger.debug("rotating to key %s", mask(rec.key))
         return rec.key
 
@@ -1248,15 +1274,24 @@ class AsyncKeyPool:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
+        callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
         async with self._get_lock():
             rec = self._find_record(key)
             if rec is None:
                 return
+            duration = retry_after if retry_after is not None else self.cooldown_seconds
             rec.state = KeyState.COOLDOWN
-            rec.cooldown_until = time.monotonic() + (retry_after if retry_after is not None else self.cooldown_seconds)
+            rec.cooldown_until = time.monotonic() + duration
             rec.failure_count += 1
             rec.last_error_code = error_code
-            rec.last_error_message = error_message
+            rec.last_error_message = self._safe_message(error_message or "") or None
+            callback = (
+                self.on_cooldown,
+                (mask(rec.key), duration, self._safe_message(error_message or error_code or "manual")),
+            )
+        if callback is not None:
+            await self._invoke_callback(callback[0], *callback[1])
+        logger.info("key %s entered cooldown for %.1fs", mask(key), duration)
 
     async def mark_invalid(
         self,
@@ -1264,13 +1299,21 @@ class AsyncKeyPool:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
+        callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
         async with self._get_lock():
             rec = self._find_record(key)
             if rec is None:
                 return
             rec.state = KeyState.DISABLED
             rec.last_error_code = error_code
-            rec.last_error_message = error_message
+            rec.last_error_message = self._safe_message(error_message or "") or None
+            callback = (
+                self.on_disabled,
+                (mask(rec.key), self._safe_message(error_message or error_code or "manual")),
+            )
+        if callback is not None:
+            await self._invoke_callback(callback[0], *callback[1])
+        logger.info("key %s disabled", mask(key))
 
     async def mark_success(self, key: str) -> None:
         async with self._get_lock():

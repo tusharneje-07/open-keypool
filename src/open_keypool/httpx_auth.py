@@ -52,6 +52,7 @@ class KeyPoolAuth(httpx.Auth):
             key = await self.pool.get_key()
             request.headers[self.header] = self._value(key)
             response = yield request
+            await response.aread()
             body = _response_body(response)
             state = await self.pool.handle_response(key, response.status_code, dict(response.headers), body)
             if state == KeyState.ACTIVE:
