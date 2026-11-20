@@ -1121,7 +1121,7 @@ class AsyncKeyPool:
 
         self._records: list[_KeyRecord] = [_KeyRecord(key=k) for k in keys]
         self._round_robin_index: int = 0
-        self._lock: asyncio.Lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
 
     def _find_record(self, key: str) -> _KeyRecord | None:
         for rec in self._records:
@@ -1139,6 +1139,12 @@ class AsyncKeyPool:
     def _active_records(self) -> list[_KeyRecord]:
         return [r for r in self._records if r.state == KeyState.ACTIVE]
 
+    def _get_lock(self) -> asyncio.Lock:
+        """Create the lock inside the active event loop (Python 3.9 safe)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
     async def _invoke_callback(self, callback: Callable[..., Any] | None, *args: Any) -> None:
         if callback is None:
             return
@@ -1150,7 +1156,7 @@ class AsyncKeyPool:
             logger.error("open_keypool callback failed: %s", self._safe_message(str(exc)))
 
     async def get_key(self) -> str:
-        async with self._lock:
+        async with self._get_lock():
             self._recover_cooldown_keys()
             active = self._active_records()
 
@@ -1199,7 +1205,7 @@ class AsyncKeyPool:
         )
 
         callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
-        async with self._lock:
+        async with self._get_lock():
             rec = self._find_record(key)
             if rec is None:
                 return KeyState.DISABLED
@@ -1242,7 +1248,7 @@ class AsyncKeyPool:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        async with self._lock:
+        async with self._get_lock():
             rec = self._find_record(key)
             if rec is None:
                 return
@@ -1258,7 +1264,7 @@ class AsyncKeyPool:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        async with self._lock:
+        async with self._get_lock():
             rec = self._find_record(key)
             if rec is None:
                 return
@@ -1267,7 +1273,7 @@ class AsyncKeyPool:
             rec.last_error_message = error_message
 
     async def mark_success(self, key: str) -> None:
-        async with self._lock:
+        async with self._get_lock():
             rec = self._find_record(key)
             if rec is None:
                 return
@@ -1278,7 +1284,7 @@ class AsyncKeyPool:
             rec.last_error_message = None
 
     async def status(self) -> dict[str, dict]:
-        async with self._lock:
+        async with self._get_lock():
             result: dict[str, dict] = {}
             now = time.monotonic()
             for rec in self._records:
@@ -1304,12 +1310,12 @@ class AsyncKeyPool:
             return result
 
     async def add_key(self, key: str) -> None:
-        async with self._lock:
+        async with self._get_lock():
             if self._find_record(key) is None:
                 self._records.append(_KeyRecord(key=key))
 
     async def remove_key(self, key: str) -> None:
-        async with self._lock:
+        async with self._get_lock():
             rec = self._find_record(key)
             if rec is not None:
                 self._records.remove(rec)
@@ -1594,7 +1600,7 @@ class AsyncKeyPool:
         return ", ".join(parts) if parts else "unknown"
 
     async def _seconds_until_soonest_recovery(self) -> float | None:
-        async with self._lock:
+        async with self._get_lock():
             self._recover_cooldown_keys()
             values = [
                 rec.cooldown_until - time.monotonic()
