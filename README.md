@@ -1,5 +1,11 @@
 # open-keypool
 
+[![PyPI](https://img.shields.io/pypi/v/open-keypool)](https://pypi.org/project/open-keypool/)
+[![Python](https://img.shields.io/pypi/pyversions/open-keypool)](https://pypi.org/project/open-keypool/)
+[![License](https://img.shields.io/pypi/l/open-keypool)](LICENSE)
+[![CI](https://github.com/tusharneje-07/open-keypool/actions/workflows/test.yml/badge.svg)](https://github.com/tusharneje-07/open-keypool/actions/workflows/test.yml)
+[![Downloads](https://static.pepy.tech/badge/open-keypool)](https://pepy.tech/project/open-keypool)
+
 Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-limit errors. Provide a list of keys (or pull them from Doppler, `.env`, or JSON), choose a rotation strategy (round-robin or least-recently-used), and the pool handles cooldown on rate-limit responses and permanent disablement on invalid keys — all thread-safe.
 
 ## Install
@@ -48,7 +54,7 @@ asyncio.run(main())
 
 ### Provider Presets
 
-Pre-configure how response rate-limit headers and error structures are handled (`"groq"`, `"openai"`, `"gemini"`, `"together"`):
+Pre-configure how response rate-limit headers and error structures are handled (`"groq"`, `"openai"`, `"gemini"`, `"together"`, `"openrouter"`, `"cerebras"`, `"mistral"`, `"anthropic"`):
 
 ```python
 pool = KeyPool(keys=["sk-groq-1", "sk-groq-2"], provider="groq")
@@ -90,7 +96,8 @@ for attempt in range(pool.max_retries):
 | **2xx** | Marks success — clears errors, resets failure count |
 | **429**, **413**, or `"rate_limit_exceeded"` in body | Marks cooldown, reads `Retry-After` header |
 | **401**, **403** | Permanently disables the key |
-| **5xx** | Places on cooldown (transient) |
+| **408**, **5xx** | Places on a short transient cooldown |
+| Other **4xx** | Stays active and is returned to the caller |
 
 Returns `KeyState` so you can branch on the result.
 
@@ -154,7 +161,63 @@ gcp_pool = KeyPool.from_gcp_secrets("my-app-secrets", project_id="my-project", k
 | `max_retries` | `int` | `3` | Max retry count reference for the caller's loop. |
 | `cooldown_seconds` | `int` | `60` | How long a rate-limited key stays in cooldown. |
 | `strategy` | `str` | `"round_robin"` | Rotation strategy: `"round_robin"` or `"lru"`. |
-| `provider` | `str` | `None` | Provider preset: `"groq"`, `"openai"`, `"gemini"`, `"together"`. |
+| `provider` | `str` | `None` | Provider preset: `"groq"`, `"openai"`, `"gemini"`, `"together"`, `"openrouter"`, `"cerebras"`, `"mistral"`, or `"anthropic"`. |
+| `transient_cooldown_seconds` | `float` | `5` | Cooldown for 408 and 5xx responses. |
+| `wait_for_recovery` | `bool` | `False` | Let `call()` wait for a cooling-down key. |
+| `max_wait_seconds` | `float` | `30.0` | Maximum wait budget for one call. |
+| `on_cooldown`, `on_disabled`, `on_exhausted` | callback | `None` | Optional lifecycle callbacks; keys are masked. |
+
+### `httpx` authentication
+
+Use `KeyPoolAuth` with any client that accepts a custom `httpx` client:
+
+```python
+import httpx
+from open_keypool import KeyPool, KeyPoolAuth
+
+pool = KeyPool(["key-one", "key-two"], provider="openai")
+with httpx.Client(auth=KeyPoolAuth(pool)) as client:
+    response = client.get("https://api.openai.com/v1/models")
+```
+
+Set `scheme=None` for raw-key headers such as `x-goog-api-key`. Use
+`AsyncKeyPool` with `httpx.AsyncClient`; async callbacks are supported.
+
+### Logging
+
+The library uses the `open_keypool` logger. It installs a `NullHandler` by
+default; applications can opt in to INFO/WARNING lifecycle messages or DEBUG
+rotation messages with normal Python logging configuration. Keys are always
+masked.
+
+### 5-minute hackathon setup
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install open-keypool
+```
+
+Put `KEY_1` and `KEY_2` in your environment, then:
+
+```python
+import os
+import httpx
+from open_keypool import KeyPool
+
+pool = KeyPool([os.environ["KEY_1"], os.environ["KEY_2"]], provider="groq")
+response = pool.call(
+    lambda key: httpx.get(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+)
+print(response.status_code)
+```
+
+### Limitations
+
+State is per-process. Each gunicorn/uvicorn worker has its own view of the
+keys, and this package is not a distributed rate limiter.
 
 ## Doppler caching
 

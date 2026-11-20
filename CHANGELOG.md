@@ -5,6 +5,23 @@ All notable changes to `open-keypool` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-20
+
+### Added
+- Added transient 408/5xx cooldowns, optional recovery waiting, safe callbacks, and masked logging.
+- Added `KeyPoolAuth` for sync and async `httpx` clients.
+- Added OpenRouter, Cerebras, Mistral, and Anthropic provider presets.
+- Added release, contribution, issue-template, and Dependabot configuration.
+
+### Changed (behavior)
+- Client errors other than documented authentication and rate-limit signals now stay ACTIVE, do not increment `failure_count`, and are returned immediately by `call()`.
+- 408 and 5xx responses use the new five-second transient cooldown by default; `Retry-After` still wins.
+- Added a `Typing :: Typed` package marker and bumped the package version to 0.4.0.
+
+### Fixed
+- Prevented raw API keys from appearing in record representations, status snapshots, exceptions, callbacks, and logs.
+- Kept constructor options consistent across all sync and async secret loaders.
+
 ## [0.3.0] - 2026-09-25
 
 ### Added

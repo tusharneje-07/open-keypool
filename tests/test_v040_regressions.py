@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 
 import httpx
@@ -117,3 +118,30 @@ async def test_async_callback_can_be_awaited():
     pool = AsyncKeyPool(["key-a"], on_disabled=callback)
     await pool.handle_response("key-a", 401)
     assert events == [(mask("key-a"), "401")]
+
+
+@pytest.mark.parametrize(
+    "pool_type, loader",
+    [
+        (KeyPool, "from_doppler"),
+        (KeyPool, "from_env"),
+        (KeyPool, "from_json"),
+        (KeyPool, "from_aws_secrets"),
+        (KeyPool, "from_gcp_secrets"),
+        (AsyncKeyPool, "from_doppler"),
+        (AsyncKeyPool, "from_env"),
+        (AsyncKeyPool, "from_json"),
+        (AsyncKeyPool, "from_aws_secrets"),
+        (AsyncKeyPool, "from_gcp_secrets"),
+    ],
+)
+def test_every_loader_accepts_new_constructor_options(pool_type, loader):
+    params = inspect.signature(getattr(pool_type, loader)).parameters
+    assert "pool_kwargs" in params
+    pool = pool_type(
+        ["key-a"],
+        transient_cooldown_seconds=2,
+        wait_for_recovery=True,
+        max_wait_seconds=4,
+    )
+    assert pool.transient_cooldown_seconds == 2
