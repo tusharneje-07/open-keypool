@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json as _json
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ from typing import Any, Callable
 
 import cachetools
 import httpx
+
+logger = logging.getLogger("open_keypool")
 
 
 def _parse_duration_str(val: str) -> float | None:
@@ -37,16 +40,24 @@ def _parse_duration_str(val: str) -> float | None:
         return None
 
 
+class ResponseOutcome(Enum):
+    """Decision made after inspecting an HTTP response."""
+
+    ACTIVE = "active"
+    COOLDOWN = "cooldown"
+    DISABLED = "disabled"
+
+
 def _process_response_metadata(
     provider: str | None,
     status_code: int,
     headers: dict[str, str] | None,
     body: dict | str | None,
-) -> tuple[bool, bool, float | None, str, str]:
+) -> tuple[ResponseOutcome, float | None, str, str]:
     """Inspect response status, headers, and body according to provider presets.
 
     Returns:
-        (is_rate_limited, is_disabled, retry_after, error_code, error_message)
+        (outcome, retry_after, error_code, error_message)
     """
     headers = headers or {}
     h_lower = {str(k).lower(): str(v) for k, v in headers.items()}
@@ -79,64 +90,52 @@ def _process_response_metadata(
             ra_sec = None
 
     prov = provider.lower() if provider else None
-    is_rate_limited = False
-    is_disabled = False
+    rate_limited = status_code in (429, 413)
+    disabled = status_code in (401, 403)
+    rate_limited = rate_limited or error_code == "rate_limit_exceeded" or "rate limit" in error_message.lower() or "resource_exhausted" in error_message.lower()
 
+    # Provider rules are intentionally small and only use documented signals.
     if prov == "openai":
-        if status_code in (429, 413) or error_code in ("rate_limit_exceeded", "insufficient_quota") or "rate_limit" in error_type.lower() or "rate limit" in error_message.lower():
-            is_rate_limited = True
-            ra_ms = h_lower.get("retry-after-ms")
-            if ra_ms:
-                try:
-                    ra_sec = float(ra_ms) / 1000.0
-                except (ValueError, TypeError):
-                    pass
-        elif status_code in (401, 403) or error_code in ("invalid_api_key", "account_deactivated"):
-            is_disabled = True
-
+        rate_limited = rate_limited or error_code in ("rate_limit_exceeded", "insufficient_quota") or "rate_limit" in error_type.lower() or "rate limit" in error_message.lower()
+        disabled = disabled or error_code in ("invalid_api_key", "account_deactivated")
+        if h_lower.get("retry-after-ms"):
+            try:
+                ra_sec = float(h_lower["retry-after-ms"]) / 1000.0
+            except (ValueError, TypeError):
+                pass
     elif prov == "groq":
-        if status_code in (429, 413) or error_code == "rate_limit_exceeded" or "rate limit" in error_message.lower():
-            is_rate_limited = True
-            req_reset = h_lower.get("x-ratelimit-reset-requests")
-            tok_reset = h_lower.get("x-ratelimit-reset-tokens")
-            if req_reset:
-                ra_sec = _parse_duration_str(req_reset) or ra_sec
-            if tok_reset:
-                t_sec = _parse_duration_str(tok_reset)
-                if t_sec is not None:
-                    ra_sec = max(ra_sec or 0.0, t_sec)
-        elif status_code in (401, 403):
-            is_disabled = True
-
+        rate_limited = rate_limited or error_code == "rate_limit_exceeded" or "rate limit" in error_message.lower()
+        req_reset = _parse_duration_str(h_lower.get("x-ratelimit-reset-requests", ""))
+        tok_reset = _parse_duration_str(h_lower.get("x-ratelimit-reset-tokens", ""))
+        if req_reset is not None or tok_reset is not None:
+            ra_sec = max(req_reset or 0.0, tok_reset or 0.0)
     elif prov == "gemini":
-        if status_code == 429 or error_status == "RESOURCE_EXHAUSTED" or "RESOURCE_EXHAUSTED" in error_message or "RESOURCE_EXHAUSTED" in error_code:
-            is_rate_limited = True
-        elif status_code in (401, 403) or "API_KEY_INVALID" in error_message or "PERMISSION_DENIED" in error_status:
-            is_disabled = True
-
+        rate_limited = rate_limited or error_status == "RESOURCE_EXHAUSTED" or "RESOURCE_EXHAUSTED" in error_message or "RESOURCE_EXHAUSTED" in error_code
+        disabled = disabled or "API_KEY_INVALID" in error_message or "PERMISSION_DENIED" in error_status
     elif prov == "together":
-        if status_code in (429, 413) or error_type == "rate_limit_error" or error_code == "rate_limit_exceeded" or "rate limit" in error_message.lower():
-            is_rate_limited = True
-        elif status_code in (401, 403):
-            is_disabled = True
+        rate_limited = rate_limited or error_type == "rate_limit_error" or error_code == "rate_limit_exceeded" or "rate limit" in error_message.lower()
+    elif prov == "openrouter":
+        rate_limited = rate_limited or error_code == "rate_limit_exceeded"
+        # OpenRouter documents Retry-After for its 402 in-flight budget case.
+        rate_limited = rate_limited or status_code == 402 and ra_sec is not None
+        disabled = disabled or error_type in ("authentication", "permission_denied")
+    elif prov == "anthropic":
+        rate_limited = rate_limited or error_type == "rate_limit_error" or error_type == "overloaded_error"
+        disabled = disabled or error_type in ("authentication_error", "permission_error")
+    elif prov in ("cerebras", "mistral"):
+        # Their documented status handling is covered by the generic rules.
+        rate_limited = rate_limited or error_code == "rate_limit_exceeded"
 
-    # Generic check if provider preset didn't explicitly trigger
-    if not is_rate_limited and not is_disabled:
-        if 200 <= status_code < 300:
-            if error_code == "rate_limit_exceeded":
-                is_rate_limited = True
-            else:
-                return False, False, None, error_code, error_message
-        elif status_code in (429, 413) or error_code == "rate_limit_exceeded" or "rate limit" in error_message.lower() or "resource_exhausted" in error_message.lower():
-            is_rate_limited = True
-        elif status_code in (401, 403):
-            is_disabled = True
-        elif 500 <= status_code < 600:
-            is_rate_limited = True
-        else:
-            is_rate_limited = True
-
-    return is_rate_limited, is_disabled, ra_sec, error_code, error_message
+    if 200 <= status_code < 300 and not rate_limited and not disabled:
+        return ResponseOutcome.ACTIVE, None, error_code, error_message
+    if disabled:
+        return ResponseOutcome.DISABLED, None, error_code, error_message
+    if rate_limited:
+        return ResponseOutcome.COOLDOWN, ra_sec, error_code, error_message
+    if status_code == 408 or 500 <= status_code < 600:
+        return ResponseOutcome.COOLDOWN, ra_sec, error_code, error_message
+    # Client mistakes must be surfaced without penalising the credential.
+    return ResponseOutcome.ACTIVE, None, error_code, error_message
 
 
 class KeyState(Enum):
@@ -158,7 +157,7 @@ class KeyState(Enum):
 class _KeyRecord:
     """Internal representation of a single API key and its health metadata."""
 
-    key: str
+    key: str = field(repr=False)
     state: KeyState = KeyState.ACTIVE
     cooldown_until: float | None = None
     last_used: float = field(default_factory=time.monotonic)
@@ -252,6 +251,13 @@ class KeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        *,
+        transient_cooldown_seconds: float = 5,
+        wait_for_recovery: bool = False,
+        max_wait_seconds: float = 30.0,
+        on_cooldown: Callable[[str, float, str], Any] | None = None,
+        on_disabled: Callable[[str, str], Any] | None = None,
+        on_exhausted: Callable[[str], Any] | None = None,
     ) -> None:
         if not keys:
             raise ValueError("KeyPool requires at least one key (keys must be a non-empty list).")
@@ -263,10 +269,24 @@ class KeyPool:
         self.cooldown_seconds: int = cooldown_seconds
         self.strategy: str = strategy
         self.provider: str | None = provider.lower() if provider else None
+        self.transient_cooldown_seconds = transient_cooldown_seconds
+        self.wait_for_recovery = wait_for_recovery
+        self.max_wait_seconds = max_wait_seconds
+        self.on_cooldown = on_cooldown
+        self.on_disabled = on_disabled
+        self.on_exhausted = on_exhausted
 
         self._records: list[_KeyRecord] = [_KeyRecord(key=k) for k in keys]
         self._round_robin_index: int = 0
         self._lock: threading.Lock = threading.Lock()
+
+    def _invoke_callback(self, callback: Callable[..., Any] | None, *args: Any) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception as exc:
+            logger.error("open_keypool callback failed: %s", self._safe_message(str(exc)))
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -286,6 +306,7 @@ class KeyPool:
             if rec.state == KeyState.COOLDOWN and rec.cooldown_until is not None and now >= rec.cooldown_until:
                 rec.state = KeyState.ACTIVE
                 rec.cooldown_until = None
+                logger.info("key %s recovered", mask(rec.key))
 
     def _active_records(self) -> list[_KeyRecord]:
         """Return all currently-ACTIVE records."""
@@ -303,6 +324,7 @@ class KeyPool:
         strategy: str = "round_robin",
         provider: str | None = None,
         force_refresh: bool = False,
+        **pool_kwargs: Any,
     ) -> KeyPool:
         """Create a ``KeyPool`` by fetching API keys from Doppler."""
         cache_key = (token, project, config, key_prefix)
@@ -316,6 +338,7 @@ class KeyPool:
                     cooldown_seconds=cooldown_seconds,
                     strategy=strategy,
                     provider=provider,
+                    **pool_kwargs,
                 )
 
         try:
@@ -355,6 +378,7 @@ class KeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -366,6 +390,7 @@ class KeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> KeyPool:
         """Create a ``KeyPool`` from environment variables matching a suffix."""
         if not suffix:
@@ -400,6 +425,7 @@ class KeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -411,6 +437,7 @@ class KeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> KeyPool:
         """Create a ``KeyPool`` from a JSON file."""
         import json as _json
@@ -455,6 +482,7 @@ class KeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -470,6 +498,7 @@ class KeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> KeyPool:
         """Create a ``KeyPool`` by fetching secrets from AWS Secrets Manager."""
         try:
@@ -521,6 +550,7 @@ class KeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -534,6 +564,7 @@ class KeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> KeyPool:
         """Create a ``KeyPool`` by fetching secrets from GCP Secret Manager."""
         try:
@@ -584,6 +615,7 @@ class KeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -690,6 +722,7 @@ class KeyPool:
                 rec = min(active, key=lambda r: r.last_used)
                 rec.last_used = time.monotonic()
 
+        logger.debug("rotating to key %s", mask(rec.key))
         return rec.key
 
     def handle_response(
@@ -752,44 +785,76 @@ class KeyPool:
         body: dict | str | None = None,
     ) -> KeyState:
         """Feed an HTTP response to the pool — it decides what to do with the key."""
-        is_rl, is_dis, ra_sec, err_code, err_msg = _process_response_metadata(
+        outcome, ra_sec, err_code, err_msg = _process_response_metadata(
             self.provider, status_code, headers, body
         )
 
+        callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
         with self._lock:
             rec = self._find_record(key)
             if rec is None:
                 return KeyState.DISABLED
 
             rec.last_status_code = status_code
+            err_msg = self._safe_message(err_msg)
 
-            if not is_rl and not is_dis:
+            if outcome == ResponseOutcome.ACTIVE:
                 rec.failure_count = 0
                 rec.state = KeyState.ACTIVE
-                rec.last_error_code = None
-                rec.last_error_message = None
-                return KeyState.ACTIVE
-
-            if is_dis:
+                rec.last_error_code = None if 200 <= status_code < 300 else err_code
+                rec.last_error_message = None if 200 <= status_code < 300 else err_msg
+                result = KeyState.ACTIVE
+            elif outcome == ResponseOutcome.DISABLED:
                 rec.state = KeyState.DISABLED
                 rec.last_error_code = err_code
                 rec.last_error_message = err_msg
-                return KeyState.DISABLED
+                callback = (self.on_disabled, (mask(rec.key), err_msg or err_code))
+                result = KeyState.DISABLED
+            else:
+                duration = ra_sec if ra_sec is not None else (
+                    self.transient_cooldown_seconds if status_code == 408 or status_code >= 500
+                    else self.cooldown_seconds
+                )
+                rec.state = KeyState.COOLDOWN
+                rec.cooldown_until = time.monotonic() + duration
+                rec.failure_count += 1
+                rec.last_error_code = err_code
+                rec.last_error_message = err_msg
+                callback = (self.on_cooldown, (mask(rec.key), duration, err_msg or err_code))
+                result = KeyState.COOLDOWN
 
-            rec.state = KeyState.COOLDOWN
-            rec.cooldown_until = time.monotonic() + (
-                ra_sec if ra_sec is not None else self.cooldown_seconds
-            )
-            rec.failure_count += 1
-            rec.last_error_code = err_code
-            rec.last_error_message = err_msg
-            return KeyState.COOLDOWN
+        if callback is not None:
+            self._invoke_callback(callback[0], *callback[1])
+        if result == KeyState.COOLDOWN:
+            logger.info("key %s entered cooldown for %.1fs", mask(key), callback[1][1] if callback else 0)
+        elif result == KeyState.DISABLED:
+            logger.info("key %s disabled", mask(key))
+        return result
 
     def call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute *fn* with an ACTIVE API key from the pool, handling rotation automatically."""
         last_exc: Exception | None = None
-        for _ in range(self.max_retries):
-            key = self.get_key()
+        started = time.monotonic()
+        waited = 0.0
+        attempts = 0
+        while attempts < self.max_retries:
+            try:
+                key = self.get_key()
+            except AllKeysExhaustedError as exc:
+                remaining = self._seconds_until_soonest_recovery()
+                budget = min(self.max_wait_seconds - (time.monotonic() - started), self.max_wait_seconds - waited)
+                if self.wait_for_recovery and remaining is not None and budget > 0:
+                    delay = min(remaining, budget)
+                    logger.info("waiting %.1fs for key recovery", delay)
+                    time.sleep(delay)
+                    waited += delay
+                    if waited >= self.max_wait_seconds:
+                        break
+                    continue
+                self._invoke_callback(self.on_exhausted, self._safe_message(str(exc)))
+                logger.warning("key pool exhausted")
+                raise
+            attempts += 1
             try:
                 res = fn(key, *args, **kwargs)
             except Exception as exc:
@@ -832,7 +897,7 @@ class KeyPool:
 
         if last_exc:
             raise AllKeysExhaustedError(
-                f"All retries ({self.max_retries}) exhausted. Last exception: {last_exc}"
+                f"All retries ({self.max_retries}) exhausted. Last exception: {self._safe_message(str(last_exc))}"
             ) from last_exc
         raise AllKeysExhaustedError(
             f"All retries ({self.max_retries}) exhausted without a successful response."
@@ -881,7 +946,8 @@ class KeyPool:
             rec.cooldown_until = time.monotonic() + (retry_after if retry_after is not None else self.cooldown_seconds)
             rec.failure_count += 1
             rec.last_error_code = error_code
-            rec.last_error_message = error_message
+            rec.last_error_message = self._safe_message(error_message or "") or None
+            logger.info("key %s entered cooldown for %.1fs", mask(rec.key), retry_after if retry_after is not None else self.cooldown_seconds)
 
     def mark_invalid(
         self,
@@ -915,7 +981,8 @@ class KeyPool:
                 return
             rec.state = KeyState.DISABLED
             rec.last_error_code = error_code
-            rec.last_error_message = error_message
+            rec.last_error_message = self._safe_message(error_message or "") or None
+            logger.info("key %s disabled", mask(rec.key))
 
     def mark_success(self, key: str) -> None:
         """Reset a key's failure count to 0 and keep it ACTIVE.
@@ -1001,6 +1068,21 @@ class KeyPool:
                 parts.append(f"{mask(rec.key)} in {max(0, rec.cooldown_until - now):.1f}s")
         return ", ".join(parts) if parts else "unknown"
 
+    def _seconds_until_soonest_recovery(self) -> float | None:
+        with self._lock:
+            self._recover_cooldown_keys()
+            values = [
+                rec.cooldown_until - time.monotonic()
+                for rec in self._records
+                if rec.state == KeyState.COOLDOWN and rec.cooldown_until is not None
+            ]
+            return min((value for value in values if value > 0), default=None)
+
+    def _safe_message(self, message: str) -> str:
+        for rec in self._records:
+            message = message.replace(rec.key, mask(rec.key))
+        return message
+
 
 class AsyncKeyPool:
     """An asyncio-compatible pool of API keys with cooldown and rotation strategies."""
@@ -1012,6 +1094,13 @@ class AsyncKeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        *,
+        transient_cooldown_seconds: float = 5,
+        wait_for_recovery: bool = False,
+        max_wait_seconds: float = 30.0,
+        on_cooldown: Callable[[str, float, str], Any] | None = None,
+        on_disabled: Callable[[str, str], Any] | None = None,
+        on_exhausted: Callable[[str], Any] | None = None,
     ) -> None:
         if not keys:
             raise ValueError("AsyncKeyPool requires at least one key (keys must be a non-empty list).")
@@ -1023,6 +1112,12 @@ class AsyncKeyPool:
         self.cooldown_seconds: int = cooldown_seconds
         self.strategy: str = strategy
         self.provider: str | None = provider.lower() if provider else None
+        self.transient_cooldown_seconds = transient_cooldown_seconds
+        self.wait_for_recovery = wait_for_recovery
+        self.max_wait_seconds = max_wait_seconds
+        self.on_cooldown = on_cooldown
+        self.on_disabled = on_disabled
+        self.on_exhausted = on_exhausted
 
         self._records: list[_KeyRecord] = [_KeyRecord(key=k) for k in keys]
         self._round_robin_index: int = 0
@@ -1043,6 +1138,16 @@ class AsyncKeyPool:
 
     def _active_records(self) -> list[_KeyRecord]:
         return [r for r in self._records if r.state == KeyState.ACTIVE]
+
+    async def _invoke_callback(self, callback: Callable[..., Any] | None, *args: Any) -> None:
+        if callback is None:
+            return
+        try:
+            result = callback(*args)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.error("open_keypool callback failed: %s", self._safe_message(str(exc)))
 
     async def get_key(self) -> str:
         async with self._lock:
@@ -1076,6 +1181,7 @@ class AsyncKeyPool:
                 rec = min(active, key=lambda r: r.last_used)
                 rec.last_used = time.monotonic()
 
+        logger.debug("rotating to key %s", mask(rec.key))
         return rec.key
 
     async def async_get_key(self) -> str:
@@ -1088,38 +1194,46 @@ class AsyncKeyPool:
         headers: dict[str, str] | None = None,
         body: dict | str | None = None,
     ) -> KeyState:
-        is_rl, is_dis, ra_sec, err_code, err_msg = _process_response_metadata(
+        outcome, ra_sec, err_code, err_msg = _process_response_metadata(
             self.provider, status_code, headers, body
         )
 
+        callback: tuple[Callable[..., Any] | None, tuple[Any, ...]] | None = None
         async with self._lock:
             rec = self._find_record(key)
             if rec is None:
                 return KeyState.DISABLED
 
             rec.last_status_code = status_code
+            err_msg = self._safe_message(err_msg)
 
-            if not is_rl and not is_dis:
+            if outcome == ResponseOutcome.ACTIVE:
                 rec.failure_count = 0
                 rec.state = KeyState.ACTIVE
-                rec.last_error_code = None
-                rec.last_error_message = None
-                return KeyState.ACTIVE
-
-            if is_dis:
+                rec.last_error_code = None if 200 <= status_code < 300 else err_code
+                rec.last_error_message = None if 200 <= status_code < 300 else err_msg
+                result = KeyState.ACTIVE
+            elif outcome == ResponseOutcome.DISABLED:
                 rec.state = KeyState.DISABLED
                 rec.last_error_code = err_code
                 rec.last_error_message = err_msg
-                return KeyState.DISABLED
-
-            rec.state = KeyState.COOLDOWN
-            rec.cooldown_until = time.monotonic() + (
-                ra_sec if ra_sec is not None else self.cooldown_seconds
-            )
-            rec.failure_count += 1
-            rec.last_error_code = err_code
-            rec.last_error_message = err_msg
-            return KeyState.COOLDOWN
+                callback = (self.on_disabled, (mask(rec.key), err_msg or err_code))
+                result = KeyState.DISABLED
+            else:
+                duration = ra_sec if ra_sec is not None else (
+                    self.transient_cooldown_seconds if status_code == 408 or status_code >= 500
+                    else self.cooldown_seconds
+                )
+                rec.state = KeyState.COOLDOWN
+                rec.cooldown_until = time.monotonic() + duration
+                rec.failure_count += 1
+                rec.last_error_code = err_code
+                rec.last_error_message = err_msg
+                callback = (self.on_cooldown, (mask(rec.key), duration, err_msg or err_code))
+                result = KeyState.COOLDOWN
+        if callback is not None:
+            await self._invoke_callback(callback[0], *callback[1])
+        return result
 
     async def mark_rate_limited(
         self,
@@ -1202,8 +1316,26 @@ class AsyncKeyPool:
 
     async def call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         last_exc: Exception | None = None
-        for _ in range(self.max_retries):
-            key = await self.get_key()
+        started = time.monotonic()
+        waited = 0.0
+        attempts = 0
+        while attempts < self.max_retries:
+            try:
+                key = await self.get_key()
+            except AllKeysExhaustedError:
+                remaining = await self._seconds_until_soonest_recovery()
+                budget = min(self.max_wait_seconds - (time.monotonic() - started), self.max_wait_seconds - waited)
+                if self.wait_for_recovery and remaining is not None and budget > 0:
+                    delay = min(remaining, budget)
+                    await asyncio.sleep(delay)
+                    waited += delay
+                    if waited >= self.max_wait_seconds:
+                        break
+                    continue
+                await self._invoke_callback(self.on_exhausted, "No active keys available.")
+                logger.warning("key pool exhausted")
+                raise
+            attempts += 1
             try:
                 if inspect.iscoroutinefunction(fn):
                     res = await fn(key, *args, **kwargs)
@@ -1251,7 +1383,7 @@ class AsyncKeyPool:
 
         if last_exc:
             raise AllKeysExhaustedError(
-                f"All retries ({self.max_retries}) exhausted. Last exception: {last_exc}"
+                f"All retries ({self.max_retries}) exhausted. Last exception: {self._safe_message(str(last_exc))}"
             ) from last_exc
         raise AllKeysExhaustedError(
             f"All retries ({self.max_retries}) exhausted without a successful response."
@@ -1269,6 +1401,7 @@ class AsyncKeyPool:
         strategy: str = "round_robin",
         provider: str | None = None,
         force_refresh: bool = False,
+        **pool_kwargs: Any,
     ) -> AsyncKeyPool:
         cache_key = (token, project, config, key_prefix)
 
@@ -1281,6 +1414,7 @@ class AsyncKeyPool:
                     cooldown_seconds=cooldown_seconds,
                     strategy=strategy,
                     provider=provider,
+                    **pool_kwargs,
                 )
 
         try:
@@ -1321,6 +1455,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -1332,6 +1467,7 @@ class AsyncKeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> AsyncKeyPool:
         sync_pool = KeyPool.from_env(
             suffix=suffix,
@@ -1340,6 +1476,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
         return cls(
             keys=[r.key for r in sync_pool._records],
@@ -1347,6 +1484,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -1358,6 +1496,7 @@ class AsyncKeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> AsyncKeyPool:
         sync_pool = KeyPool.from_json(
             path=path,
@@ -1366,6 +1505,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
         return cls(
             keys=[r.key for r in sync_pool._records],
@@ -1373,6 +1513,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -1388,6 +1529,7 @@ class AsyncKeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> AsyncKeyPool:
         sync_pool = KeyPool.from_aws_secrets(
             secret_name=secret_name,
@@ -1400,6 +1542,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
         return cls(
             keys=[r.key for r in sync_pool._records],
@@ -1407,6 +1550,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     @classmethod
@@ -1420,6 +1564,7 @@ class AsyncKeyPool:
         cooldown_seconds: int = 60,
         strategy: str = "round_robin",
         provider: str | None = None,
+        **pool_kwargs: Any,
     ) -> AsyncKeyPool:
         sync_pool = KeyPool.from_gcp_secrets(
             secret_id=secret_id,
@@ -1430,6 +1575,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
         return cls(
             keys=[r.key for r in sync_pool._records],
@@ -1437,6 +1583,7 @@ class AsyncKeyPool:
             cooldown_seconds=cooldown_seconds,
             strategy=strategy,
             provider=provider,
+            **pool_kwargs,
         )
 
     def _cooldown_summary(self, cooldown_records: list[_KeyRecord], now: float) -> str:
@@ -1445,3 +1592,18 @@ class AsyncKeyPool:
             if rec.cooldown_until is not None:
                 parts.append(f"{mask(rec.key)} in {max(0, rec.cooldown_until - now):.1f}s")
         return ", ".join(parts) if parts else "unknown"
+
+    async def _seconds_until_soonest_recovery(self) -> float | None:
+        async with self._lock:
+            self._recover_cooldown_keys()
+            values = [
+                rec.cooldown_until - time.monotonic()
+                for rec in self._records
+                if rec.state == KeyState.COOLDOWN and rec.cooldown_until is not None
+            ]
+            return min((value for value in values if value > 0), default=None)
+
+    def _safe_message(self, message: str) -> str:
+        for rec in self._records:
+            message = message.replace(rec.key, mask(rec.key))
+        return message
