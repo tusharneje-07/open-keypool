@@ -6,7 +6,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 authors = [
-    { name = "<MY FULL NAME>" },
+    { name = "Tushar Neje" },
 ]
 keywords = ["llm", "rate-limit", "groq", "openai", "hackathon"]
 classifiers = [
