@@ -1,6 +1,6 @@
 # open-keypool
 
-[![PyPI](https://img.shields.io/pypi/v/open-keypool)](https://pypi.org/project/open-keypool/)
+[![PyPI](https://img.shields.io/pypi/v/open-keypool?cacheSeconds=300)](https://pypi.org/project/open-keypool/)
 [![Python](https://img.shields.io/pypi/pyversions/open-keypool)](https://pypi.org/project/open-keypool/)
 [![License](https://img.shields.io/pypi/l/open-keypool)](LICENSE)
 [![CI](https://github.com/tusharneje-07/open-keypool/actions/workflows/test.yml/badge.svg)](https://github.com/tusharneje-07/open-keypool/actions/workflows/test.yml)
@@ -8,7 +8,7 @@
 
 Minimal Python library for pooling and rotating API keys to avoid HTTP 429 rate-limit errors. Provide a list of keys (or pull them from Doppler, `.env`, or JSON), choose a rotation strategy (round-robin or least-recently-used), and the pool handles cooldown on rate-limit responses and permanent disablement on invalid keys — all thread-safe.
 
-**Current release: v0.4.0**
+**Current release: v0.4.1**
 
 ## Install
 
